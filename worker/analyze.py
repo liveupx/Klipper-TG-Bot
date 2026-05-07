@@ -19,14 +19,15 @@ logger = logging.getLogger(__name__)
 
 GEMINI_MODEL = "gemini-2.5-flash-lite"
 TARGET_CLIP_COUNT = 60   # ask Gemini for this many; user keeps top 40–50
-MIN_CLIP_DURATION = 25   # seconds — anything shorter feels rushed
+MIN_CLIPS_FORCED = 5     # always return at least this many, even from "weak" content
+MIN_CLIP_DURATION = 20   # seconds — was 25; loosened to catch punchy short moments
 MAX_CLIP_DURATION = 130  # seconds — beyond this loses retention
 
 VIRAL_CLIP_PROMPT_TEMPLATE = """\
-You are an expert short-form video editor specializing in podcast clips that go viral on TikTok, Instagram Reels, YouTube Shorts, and X (Twitter). You have a track record of identifying clips that get millions of views.
+You are an expert short-form video editor specializing in podcast and interview clips that perform well on TikTok, Instagram Reels, YouTube Shorts, and X (Twitter). You have a track record of identifying clips that get high engagement.
 
 # Task
-Given the timestamped podcast transcript below, identify the {target_count} most viral-worthy moments.
+Given the timestamped transcript below, identify up to {target_count} clip-worthy moments. AT MINIMUM you MUST return {min_clips} clips, even if you think the content is "boring" — your job is to find the best clip-worthy moments that exist, not to gatekeep on perfection.
 
 # Podcast metadata
 - Title: {title}
@@ -34,28 +35,44 @@ Given the timestamped podcast transcript below, identify the {target_count} most
 - Duration: {duration_min} minutes
 
 # Hard requirements for each clip
-- Duration: 30–120 seconds (sweet spot 60–90s)
+- Duration: 20–120 seconds (sweet spot 45–90s)
 - MUST start at a natural sentence boundary, never mid-thought
-- MUST end with a punchline, conclusion, takeaway, or strong hook
-- Self-contained: a viewer who never heard the rest of the podcast must understand it
-- The first 3 seconds must hook the viewer (claim, question, surprising statement)
+- MUST end with a complete thought — a statement, conclusion, takeaway, or quote that "lands"
+- Self-contained: a viewer who never heard the rest must understand it
+- The opening line should be interesting on its own — a claim, a question, a surprising fact, a story setup, or a strong opinion
 
-# Prioritize moments with these traits (in roughly this order)
-1. Counter-intuitive claims, hot takes, contrarian ideas
-2. Concrete stories with specific details (numbers, names, places, times)
-3. Emotional peaks: laughter, surprise, anger, vulnerability, awe
-4. Punchy aphorisms or one-liners that work as a quote on their own
-5. Conflict, disagreement, or strong push-back between speakers
-6. "Most people don't realize…", "The truth is…", "Here's what nobody tells you…" framings
-7. Personal stakes: failures, regrets, near-misses, lessons learned the hard way
-8. Practical, actionable advice with a clear "do this, not that" structure
+# What makes a clip work — broaden your aperture
+This is NOT just "hot takes and one-liners." Clips can succeed on multiple dimensions:
+
+**HIGH viral potential (score 7–10):**
+- Counter-intuitive claims and hot takes
+- Punchy one-liners and aphorisms
+- Emotional peaks (surprise, anger, vulnerability, awe, laughter)
+- Concrete stories with specific details (numbers, names, places)
+- Conflict, disagreement, or strong push-back
+- "Most people don't realize…", "The truth is…" framings
+
+**SOLID clip-worthy (score 5–7):**
+- Thoughtful expert insights and analysis
+- Clear explanations of complex ideas
+- Predictions, warnings, or forward-looking statements
+- Personal experiences and "what I learned" moments
+- Behind-the-scenes details and insider perspectives
+- Clear "do this, not that" actionable advice
+- Articulate framings of important questions
+- Direct answers to questions the audience cares about
+
+**Always include if found (even with no obvious "hook"):**
+- The most quotable line in the entire interview
+- The interviewee's strongest argument
+- A moment where they say something unexpected for someone in their position
+- The clearest articulation of why this topic matters
 
 # Avoid
 - Filler intros, sponsor reads, "welcome back to the show"
-- Setup talk: "can you hear me", "let me adjust", explaining what they'll discuss
-- Vague generalities without specifics
-- Rambling tangents that don't land
-- Clips where you have to explain context to understand them
+- Setup talk: "let me adjust my mic", "as I was saying earlier"
+- Vague generalities with zero specifics
+- Clips where you'd need extensive context to follow
 
 # Caption style
 - Tweet body: 100–200 characters, hooky, ends with 1–2 hashtags
@@ -64,15 +81,18 @@ Given the timestamped podcast transcript below, identify the {target_count} most
 - No emoji spam; max 1 relevant emoji
 - DO NOT include channel credit in the caption — that's appended automatically downstream
 
-# Virality score (0–10)
-Use the FULL range. Most clips should be 5–7. Reserve:
-- 9–10 for genuinely killer moments you'd bet money will hit a million views
-- 8 for strong clips you'd post yourself
-- 5–7 for solid filler clips
-- below 5 for borderline / risky clips that might still work
+# Virality score (0–10) — USE THE FULL RANGE
+Most clips should be 5–7. Reserve:
+- 9–10 for genuinely killer moments you'd bet money on going viral
+- 8 for strong clips you'd post yourself today
+- 6–7 for solid filler clips with a clear hook
+- 4–5 for borderline clips that work in context but lack a punch
+- below 4 only for the worst inclusion in your top set
+
+For "measured" content (news interviews, policy talks, technical discussions), DO NOT artificially boost scores — but DO include enough clips to give the user material to choose from. A score of 5 is still publishable.
 
 # Output format
-Return ONLY a valid JSON object matching this exact schema. No markdown fences, no commentary, no leading text. Just the JSON.
+Return ONLY a valid JSON object matching this exact structure. No markdown fences, no commentary, no leading text. Just the JSON.
 
 {{
   "clips": [
@@ -93,8 +113,11 @@ Return ONLY a valid JSON object matching this exact schema. No markdown fences, 
 - hook: 4–8 words, under 60 chars total, no quotes, title case
 - caption: 100–200 chars including hashtags
 - virality_score: float 0.0–10.0, one decimal place
-- reason: one short sentence, what makes this clip work
+- reason: one short sentence on why this clip works
 - topic: 1–3 words, kebab-case if multi-word
+
+# Final reminder
+You MUST return at least {min_clips} clips. If the content is challenging (a measured policy interview, a technical talk, a low-energy conversation), find the most clip-worthy moments anyway and score them honestly (a 5 is fine). Returning fewer than {min_clips} is failure. Returning a thoughtful set scored honestly is success.
 
 # Transcript (with [HH:MM:SS] timestamps per segment)
 {transcript_block}
@@ -102,13 +125,11 @@ Return ONLY a valid JSON object matching this exact schema. No markdown fences, 
 
 
 async def analyze_transcript(transcript: dict, metadata: dict) -> dict:
-    """Run Gemini on a transcript and return clip ranges.
-
-    Returns the raw Gemini JSON response, augmented with a `metadata` block.
-    """
+    """Run Gemini on a transcript and return clip ranges."""
     transcript_block = _format_transcript(transcript)
     prompt = VIRAL_CLIP_PROMPT_TEMPLATE.format(
         target_count=TARGET_CLIP_COUNT,
+        min_clips=MIN_CLIPS_FORCED,
         title=metadata.get("title", "Untitled"),
         channel=metadata.get("channel", "Unknown"),
         duration_min=metadata.get("duration_min", "?"),
@@ -129,7 +150,7 @@ async def analyze_transcript(transcript: dict, metadata: dict) -> dict:
             contents=prompt,
             config=types.GenerateContentConfig(
                 response_mime_type="application/json",
-                temperature=0.7,  # some creativity for hook variety
+                temperature=0.7,
                 max_output_tokens=16384,
             ),
         )
@@ -139,15 +160,27 @@ async def analyze_transcript(transcript: dict, metadata: dict) -> dict:
     parsed = _parse_response(raw_text)
 
     # Filter + sanitize
+    raw_count = len(parsed.get("clips", []))
     clips = _sanitize_clips(parsed.get("clips", []), metadata)
     clips.sort(key=lambda c: c["virality_score"], reverse=True)
 
-    logger.info("Gemini returned %d clips", len(clips))
+    if raw_count != len(clips):
+        logger.warning(
+            "Sanitize dropped %d clips (Gemini gave %d, kept %d). Check duration/timestamps.",
+            raw_count - len(clips), raw_count, len(clips),
+        )
+
+    logger.info("Gemini returned %d clips (post-sanitize)", len(clips))
     if clips:
         scores = [c["virality_score"] for c in clips]
         logger.info(
             "Score range: %.1f – %.1f (median %.1f)",
             min(scores), max(scores), sorted(scores)[len(scores) // 2],
+        )
+    else:
+        logger.error(
+            "Gemini returned 0 clips for %s. Raw response (first 500 chars):\n%s",
+            metadata.get("video_id"), raw_text[:500],
         )
 
     return {
@@ -168,7 +201,6 @@ def _format_transcript(transcript: dict) -> str:
     """Convert segments to '[HH:MM:SS] text' lines for the prompt."""
     segments = transcript.get("segments") or []
     if not segments:
-        # Fallback: use raw text without timestamps (Gemini will guess times poorly)
         return transcript.get("text", "")
 
     lines = []
@@ -190,7 +222,6 @@ def _seconds_to_hms(seconds: float) -> str:
 def _parse_response(raw_text: str) -> dict[str, Any]:
     """Parse Gemini's JSON response, tolerating accidental markdown fences."""
     text = raw_text.strip()
-    # Strip code fences if present
     text = re.sub(r"^```(?:json)?\s*", "", text)
     text = re.sub(r"\s*```$", "", text)
     try:
@@ -204,14 +235,18 @@ def _sanitize_clips(raw_clips: list, metadata: dict) -> list[dict]:
     """Drop malformed clips, clamp durations, augment with derived fields."""
     duration_sec = metadata.get("duration_sec", 0) or 0
     sane = []
+    dropped_reasons = {"duration": 0, "bounds": 0, "malformed": 0}
+
     for c in raw_clips:
         try:
             start = float(c["start"])
             end = float(c["end"])
             duration = end - start
             if duration < MIN_CLIP_DURATION or duration > MAX_CLIP_DURATION:
+                dropped_reasons["duration"] += 1
                 continue
             if start < 0 or (duration_sec > 0 and end > duration_sec + 5):
+                dropped_reasons["bounds"] += 1
                 continue
             sane.append({
                 "start": round(start, 2),
@@ -224,8 +259,12 @@ def _sanitize_clips(raw_clips: list, metadata: dict) -> list[dict]:
                 "topic": str(c.get("topic", "")).strip()[:40],
             })
         except (KeyError, ValueError, TypeError) as e:
+            dropped_reasons["malformed"] += 1
             logger.warning("Dropped malformed clip: %s (%s)", c, e)
             continue
+
+    if any(dropped_reasons.values()):
+        logger.info("Sanitize drops: %s", dropped_reasons)
     return sane
 
 
